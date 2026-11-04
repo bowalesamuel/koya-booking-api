@@ -34,16 +34,32 @@
     .chip { font: inherit; font-size: 0.9rem; padding: 6px 14px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer; }
     .chip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
 
-    .day { margin-bottom: 16px; }
-    .day h3 { font-size: 0.85rem; color: var(--muted); font-weight: 600; margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .day { border-top: 1px solid var(--border); }
+    .day:last-child { border-bottom: 1px solid var(--border); }
+    .day summary {
+      list-style: none; cursor: pointer; display: flex; align-items: center; gap: 10px;
+      padding: 12px 4px; font-size: 0.85rem; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.04em; user-select: none;
+    }
+    .day summary::-webkit-details-marker { display: none; }
+    .day summary::before {
+      content: "›"; display: inline-grid; place-items: center; width: 18px; font-size: 1.3rem; line-height: 1;
+      color: var(--text); transition: transform 0.15s ease;
+    }
+    .day[open] summary::before { transform: rotate(90deg); }
+    .day summary:hover { color: var(--text); }
+    .day summary .count { margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 500; font-size: 0.8rem; }
+    .day summary .count.none { opacity: 0.6; }
+    .day .slots { padding: 0 0 14px; }
     .slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px; }
-    .slot { font: inherit; text-align: left; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer; }
+    .slot { font: inherit; text-align: left; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); color: var(--text); cursor: pointer; min-width: 0; }
     .slot strong { display: block; font-size: 1rem; }
-    .slot span { font-size: 0.8rem; color: var(--muted); }
+    .slot span { display: block; font-size: 0.8rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .slot small { display: block; font-size: 0.75rem; color: var(--muted); opacity: 0.8; }
     .slot:hover:not(:disabled) { border-color: var(--accent); }
     .slot[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); outline: 2px solid var(--accent); }
     .slot:disabled { cursor: not-allowed; opacity: 0.45; }
-    .slot:disabled span::after { content: " · " attr(data-reason); }
+    .slot:disabled small::after { content: " · " attr(data-reason); }
 
     form { display: grid; gap: 12px; }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -143,7 +159,8 @@
     const API = "/web";
     const $ = (id) => document.getElementById(id);
 
-    const state = { slots: [], provider: "", selected: null, idemKey: null, idemBody: null, slotById: new Map() };
+    // openDays: which day sections are expanded (null = not decided yet, so open the first).
+    const state = { slots: [], provider: "", selected: null, idemKey: null, idemBody: null, slotById: new Map(), openDays: null };
 
     const fmtDay = new Intl.DateTimeFormat(undefined, { weekday: "long", day: "numeric", month: "long" });
     const fmtTime = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
@@ -214,22 +231,38 @@
         const day = fmtDay.format(new Date(s.start));
         byDay.set(day, [...(byDay.get(day) || []), s]);
       }
+      // First visit: open the first day that has a free time; keep the person's choices after that.
+      if (!state.openDays) {
+        const firstFree = [...byDay].find(([, slots]) => slots.some((s) => s.available));
+        state.openDays = new Set(firstFree ? [firstFree[0]] : []);
+      }
       for (const [day, slots] of byDay) {
-        const section = document.createElement("div");
+        const free = slots.filter((s) => s.available).length;
+        const section = document.createElement("details");
         section.className = "day";
-        section.innerHTML = `<h3></h3><div class="slots"></div>`;
-        section.querySelector("h3").textContent = day;
+        section.open = state.openDays.has(day) || slots.some((s) => s.id === state.selected?.id);
+        section.innerHTML = `<summary><span class="label"></span><span class="count"></span></summary><div class="slots"></div>`;
+        section.querySelector(".label").textContent = day;
+        const count = section.querySelector(".count");
+        count.textContent = free ? `${free} available` : "Fully booked";
+        count.classList.toggle("none", !free);
+        section.addEventListener("toggle", () => {
+          if (section.open) state.openDays.add(day);
+          else state.openDays.delete(day);
+        });
         for (const s of slots) {
           const b = document.createElement("button");
           b.type = "button";
           b.className = "slot";
           b.disabled = !s.available;
           b.setAttribute("aria-pressed", String(state.selected?.id === s.id));
-          b.innerHTML = "<strong></strong><span></span>";
+          b.innerHTML = "<strong></strong><span></span><small></small>";
           const mins = Math.round((Date.parse(s.end) - Date.parse(s.start)) / 60000);
           b.querySelector("strong").textContent = fmtTime.format(new Date(s.start));
-          b.querySelector("span").textContent = `${mins} min · ${s.provider}`;
-          if (!s.available) b.querySelector("span").dataset.reason = "Booked";
+          b.querySelector("span").textContent = s.provider;
+          b.querySelector("span").title = s.provider;
+          b.querySelector("small").textContent = `${mins} min`;
+          if (!s.available) b.querySelector("small").dataset.reason = "Booked";
           b.onclick = () => selectSlot(s);
           section.querySelector(".slots").append(b);
         }
