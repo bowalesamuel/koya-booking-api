@@ -75,6 +75,30 @@ Each email gets at most 5 booking attempts in any 60 seconds. Failed attempts co
 
 Because it's stored in Postgres rather than in memory, the limit holds across every serverless instance.
 
+## The web page
+
+`public/index.html` is plain HTML, CSS and JavaScript, with no build step. Patients can:
+
+1. **See available times**, grouped by day in their own time zone and filterable by provider. Booked times are greyed out, and times that have already started are hidden.
+2. **Book one** with their name and email.
+3. **See the confirmation** with the time, provider and booking ID. The URL (`/?booking=<id>`) works as a confirmation link that can be reopened later. They can also cancel from there.
+4. **Find their bookings** by email, 5 at a time with "Load more" (cursor pagination).
+
+**The API key never reaches the browser.** The page calls `/web/*`, a server-side function (`netlify/functions/web.mts`) that adds `X-API-Key` and passes the request through the same handler. It only exposes the patient routes (`/reset` isn't one of them), and every API rule still applies: validation, double-booking protection and rate limits.
+
+**Double-clicks and dropped connections can't double-book.** Each booking attempt gets an `Idempotency-Key` (`crypto.randomUUID()`). If the network fails and the patient presses the button again, the same key is reused. A new key is made only after the server has answered, or if the details change.
+
+Errors come back in plain language. A `409` says someone just took that time and refreshes the list, and a `429` says how many seconds to wait.
+
+## Configuration
+
+| Variable | |
+|---|---|
+| `DATABASE_URL` | Postgres connection string (`NETLIFY_DATABASE_URL` also works) |
+| `API_KEY` | The key clients must send in `X-API-Key` |
+
+For local development, copy `.env.example` to `.env`, then run `npx netlify-cli dev`. The schema is created automatically on first request.
+
 ## Run the tests
 
 Needs a local Postgres. Tests run against a real database rather than mocks.

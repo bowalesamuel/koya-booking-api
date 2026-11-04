@@ -1,0 +1,6 @@
+[build]
+  publish = "public"
+  command = "npx tsc"
+
+[functions]
+  node_bundler = "esbuild"
