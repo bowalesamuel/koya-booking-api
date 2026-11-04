@@ -1,5 +1,5 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
-import { withTx, type Db } from "./db.js";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { withTx, type Db, type Tx } from "./db.js";
 
 // Implements https://koyaacademy.com/assessment-api (Clinic booking API 1.0).
 // Web-standard Request in, Response out, so it runs on Netlify Functions and in tests alike.
@@ -54,8 +54,9 @@ export async function handle(req: Request, ctx: Context): Promise<Response> {
       return await listSlots(ctx.db, url.searchParams.get("provider"));
     }
     if (path === "/bookings") {
-      if (method !== "POST") throw new HttpError(405, "method not allowed");
-      return await createBooking(ctx.db, await readJson(req), now());
+      if (method === "POST") return await createBooking(ctx.db, req, now());
+      if (method === "GET") return await listBookings(ctx.db, url.searchParams);
+      throw new HttpError(405, "method not allowed");
     }
     const match = path.match(/^\/bookings\/([^/]+)$/);
     if (match) {
@@ -105,7 +106,7 @@ async function reset(db: Db, body: unknown): Promise<Response> {
 
   // Deletes every booking and replaces all slots, in one transaction.
   await withTx(db, async (tx) => {
-    await tx.query("truncate bookings, slots");
+    await tx.query("truncate bookings, slots, idempotency_keys");
     if (rows.length) {
       await tx.query(
         `insert into slots (id, provider, start_raw, end_raw, start_at, end_at)
@@ -154,7 +155,77 @@ function present(b: BookingRow) {
 
 const BOOKING_COLUMNS = "id, slot_id, name, email, status, created_at";
 
-async function createBooking(db: Db, body: unknown, now: Date): Promise<Response> {
+type Outcome = { status: number; body: unknown };
+
+/** Stable hash of the request body, so key order and whitespace don't matter. */
+function hashBody(raw: string): string {
+  let canonical = raw;
+  try {
+    const sort = (v: unknown): unknown =>
+      Array.isArray(v)
+        ? v.map(sort)
+        : v && typeof v === "object"
+          ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sort((v as Record<string, unknown>)[k])]))
+          : v;
+    canonical = JSON.stringify(sort(JSON.parse(raw)));
+  } catch {
+    // Not valid JSON: hash the raw text. The request gets a 400 anyway.
+  }
+  return createHash("sha256").update(canonical).digest("hex");
+}
+
+async function createBooking(db: Db, req: Request, now: Date): Promise<Response> {
+  const raw = await req.text();
+  const idemKey = req.headers.get("idempotency-key");
+  if (!idemKey) {
+    const { status, body } = await attemptBooking(db, raw, now);
+    return json(status, body);
+  }
+
+  // Level 4: the whole attempt runs in one transaction holding a lock on the
+  // key, so a retry that arrives while the first request is still running
+  // waits for it and then replays its stored response instead of booking again.
+  const requestHash = hashBody(raw);
+  const { status, body } = await withTx(db, async (tx): Promise<Outcome> => {
+    await tx.query("select pg_advisory_xact_lock(hashtext($1))", [idemKey]);
+    const { rows } = await tx.query(
+      "select request_hash, status_code, response from idempotency_keys where key = $1",
+      [idemKey],
+    );
+    if (rows[0]) {
+      if (rows[0].request_hash !== requestHash) {
+        return { status: 422, body: { error: "Idempotency-Key was already used with a different request body" } };
+      }
+      return { status: rows[0].status_code, body: rows[0].response };
+    }
+
+    const result = await attemptBooking(tx, raw, now);
+    await tx.query(
+      "insert into idempotency_keys (key, request_hash, status_code, response) values ($1, $2, $3, $4)",
+      [idemKey, requestHash, result.status, JSON.stringify(result.body)],
+    );
+    return result;
+  });
+  return json(status, body);
+}
+
+/** One booking attempt, as a status and body, so the result can be stored and replayed. */
+async function attemptBooking(q: Db | Tx, raw: string, now: Date): Promise<Outcome> {
+  try {
+    let body: unknown;
+    try {
+      body = JSON.parse(raw);
+    } catch {
+      throw new HttpError(400, "request body must be valid JSON");
+    }
+    return { status: 201, body: await bookSlot(q, body, now) };
+  } catch (err) {
+    if (err instanceof HttpError) return { status: err.status, body: { error: err.message } };
+    throw err;
+  }
+}
+
+async function bookSlot(db: Db | Tx, body: unknown, now: Date) {
   const input = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
 
   // Level 2: trim, lower-case the email, and turn away anything missing or invalid.
@@ -182,7 +253,7 @@ async function createBooking(db: Db, body: unknown, now: Date): Promise<Response
     [randomUUID(), slotId, name, email, now],
   );
   if (!rows[0]) throw new HttpError(409, "slot is already booked");
-  return json(201, present(rows[0]));
+  return present(rows[0]);
 }
 
 async function cancelBooking(db: Db, id: string): Promise<Response> {
@@ -203,4 +274,44 @@ async function getBooking(db: Db, id: string): Promise<Response> {
   const { rows } = await db.query<BookingRow>(`select ${BOOKING_COLUMNS} from bookings where id = $1`, [id]);
   if (!rows[0]) throw new HttpError(404, "booking not found");
   return json(200, present(rows[0]));
+}
+
+// Level 4: cursor pagination. The cursor is the last row's insert sequence,
+// base64url-encoded so clients treat it as opaque. Unlike page numbers, it
+// can't skip or repeat rows when new bookings arrive between pages.
+const encodeCursor = (seq: string) => Buffer.from(`seq:${seq}`).toString("base64url");
+
+function decodeCursor(cursor: string): string {
+  const m = Buffer.from(cursor, "base64url").toString().match(/^seq:(\d{1,18})$/);
+  if (!m) throw new HttpError(400, "cursor is not valid");
+  return m[1];
+}
+
+async function listBookings(db: Db, params: URLSearchParams): Promise<Response> {
+  const email = (params.get("email") ?? "").trim().toLowerCase();
+  if (!email) throw new HttpError(400, "email is required");
+
+  let limit = 10;
+  const rawLimit = params.get("limit");
+  if (rawLimit !== null) {
+    if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 50) {
+      throw new HttpError(400, "limit must be a whole number from 1 to 50");
+    }
+    limit = Number(rawLimit);
+  }
+
+  const cursor = params.get("cursor");
+  const after = cursor ? decodeCursor(cursor) : "0";
+
+  // Fetch one extra row to know whether there's another page.
+  const { rows } = await db.query<BookingRow & { seq: string }>(
+    `select seq, ${BOOKING_COLUMNS} from bookings
+     where email = $1 and seq > $2::bigint
+     order by seq
+     limit $3`,
+    [email, after, limit + 1],
+  );
+  const page = rows.slice(0, limit);
+  const nextCursor = rows.length > limit ? encodeCursor(page[page.length - 1].seq) : null;
+  return json(200, { bookings: page.map(present), next_cursor: nextCursor });
 }

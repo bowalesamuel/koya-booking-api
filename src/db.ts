@@ -29,6 +29,20 @@ create table if not exists bookings (
 -- however many requests arrive at once. Cancelled bookings don't count.
 create unique index if not exists bookings_one_confirmed_per_slot
   on bookings (slot_id) where status = 'confirmed';
+
+-- Level 4: a stable insert order for paging through a person's bookings.
+alter table bookings add column if not exists seq bigserial;
+create unique index if not exists bookings_seq on bookings (seq);
+create index if not exists bookings_email_seq on bookings (email, seq);
+
+-- Level 4: one stored response per Idempotency-Key.
+create table if not exists idempotency_keys (
+  key          text primary key,
+  request_hash text not null,
+  status_code  int not null,
+  response     jsonb not null,
+  created_at   timestamptz not null default now()
+);
 `;
 
 let pool: Db | undefined;
