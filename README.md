@@ -8,7 +8,7 @@ Built to the spec at [koyaacademy.com/assessment-api](https://koyaacademy.com/as
 ## Progress
 
 - [x] **Level 1:** list slots, book one, look up a booking
-- [ ] Level 2: API key, validation
+- [x] **Level 2:** API key, validation
 - [ ] Level 3: no double booking, cancellation
 - [ ] Level 4: idempotent retries, pagination
 - [ ] Level 5: rate limiting
@@ -23,6 +23,18 @@ Built to the spec at [koyaacademy.com/assessment-api](https://koyaacademy.com/as
 | `GET` | `/bookings/{id}` | Look up a booking |
 
 Errors are always `{ "error": "<message>" }`.
+
+### Authentication
+
+Every request needs an `X-API-Key` header matching the server's `API_KEY` environment variable. A missing or wrong key gets `401`. The key is compared in constant time. If `API_KEY` isn't set, every request is refused rather than the API being left open.
+
+### Booking rules
+
+| Status | When |
+|---|---|
+| `201` | Booked. `name` and `email` are trimmed, and `email` is stored in lower case |
+| `400` | `slot_id`, `name` or `email` missing or empty, `email` not valid, invalid JSON, or the slot has already started |
+| `404` | The slot doesn't exist |
 
 ## Run the tests
 

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { withTx, type Db } from "./db.js";
 
 // Implements https://koyaacademy.com/assessment-api (Clinic booking API 1.0).
@@ -6,8 +6,11 @@ import { withTx, type Db } from "./db.js";
 
 export interface Context {
   db: Db;
+  apiKey: string;
   now?: () => Date;
 }
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -22,9 +25,22 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+/** Constant-time compare, so the key can't be guessed from response timing. */
+function keyMatches(given: string | null, expected: string): boolean {
+  if (!given || !expected) return false;
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export async function handle(req: Request, ctx: Context): Promise<Response> {
   const now = ctx.now ?? (() => new Date());
   try {
+    // Level 2: every request needs the key. An unset key on the server locks everything.
+    if (!keyMatches(req.headers.get("x-api-key"), ctx.apiKey)) {
+      throw new HttpError(401, "missing or invalid API key");
+    }
+
     const url = new URL(req.url);
     const path = url.pathname.replace(/\/+$/, "") || "/";
     const method = req.method.toUpperCase();
@@ -137,11 +153,21 @@ function present(b: BookingRow) {
 const BOOKING_COLUMNS = "id, slot_id, name, email, status, created_at";
 
 async function createBooking(db: Db, body: unknown, now: Date): Promise<Response> {
-  const input = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
-  const { slot_id: slotId, name, email } = input as Record<string, string>;
+  const input = (body && typeof body === "object" && !Array.isArray(body) ? body : {}) as Record<string, unknown>;
 
-  const slot = await db.query("select 1 from slots where id = $1", [slotId]);
+  // Level 2: trim, lower-case the email, and turn away anything missing or invalid.
+  const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+  const slotId = str(input.slot_id);
+  const name = str(input.name);
+  const email = str(input.email).toLowerCase();
+  if (!slotId) throw new HttpError(400, "slot_id is required");
+  if (!name) throw new HttpError(400, "name is required");
+  if (!email) throw new HttpError(400, "email is required");
+  if (!EMAIL_RE.test(email)) throw new HttpError(400, "email is not valid");
+
+  const slot = await db.query("select start_at from slots where id = $1", [slotId]);
   if (!slot.rows[0]) throw new HttpError(404, "slot not found");
+  if (new Date(slot.rows[0].start_at) <= now) throw new HttpError(400, "slot has already started");
 
   const { rows } = await db.query<BookingRow>(
     `insert into bookings (id, slot_id, name, email, status, created_at)

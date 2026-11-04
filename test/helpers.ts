@@ -7,6 +7,7 @@ import { migrate } from "../src/db.js";
 // database guarantees are tested for real, not mocked.
 const DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://localhost/koya_booking_test";
 const BASE = "https://clinic.test";
+export const KEY = "test-key";
 
 export const t = {
   db: undefined as unknown as pg.Pool,
@@ -18,7 +19,7 @@ export const t = {
 beforeAll(async () => {
   t.db = new pg.Pool({ connectionString: DB_URL, max: 20 });
   await migrate(t.db);
-  t.ctx = { db: t.db, now: () => t.clock ?? new Date() };
+  t.ctx = { db: t.db, apiKey: KEY, now: () => t.clock ?? new Date() };
 });
 afterAll(() => t.db.end());
 
@@ -26,7 +27,7 @@ export function call(method: string, path: string, body?: unknown, headers: Reco
   return handle(
     new Request(BASE + path, {
       method,
-      headers: { "content-type": "application/json", ...headers },
+      headers: { "x-api-key": KEY, "content-type": "application/json", ...headers },
       body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
     }),
     t.ctx,
