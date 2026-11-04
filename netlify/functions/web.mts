@@ -32,7 +32,12 @@ export default async (req: Request) => {
     headers,
     body: req.method === "POST" ? await req.text() : undefined,
   });
-  return handle(forwarded, { db: await getDb(), apiKey });
+  try {
+    return await handle(forwarded, { db: await getDb(), apiKey });
+  } catch (err) {
+    console.error(err);
+    return Response.json({ error: "service unavailable" }, { status: 503 });
+  }
 };
 
 export const config: Config = {

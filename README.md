@@ -99,6 +99,25 @@ Errors come back in plain language. A `409` says someone just took that time and
 
 For local development, copy `.env.example` to `.env`, then run `npx netlify-cli dev`. The schema is created automatically on first request.
 
+## Running on serverless
+
+Two problems only showed up under real concurrent HTTP traffic, not in unit tests. `scripts/smoke.mjs` caught both:
+
+- **Connection exhaustion.** A burst of requests makes Netlify start many function instances at once. With a pool of 5 connections each, they ran past Postgres's connection limit (`too many clients`). Each instance now holds **one** connection (it only serves one request at a time) and releases it after 5 idle seconds. In production `DATABASE_URL` points at Neon's **pooled** endpoint, which is built for many short-lived clients.
+- **Deadlocks on cold start.** Each new instance ran `CREATE … IF NOT EXISTS` / `ALTER TABLE` on startup. Those statements take table locks even when there's nothing to create, and they deadlocked with bookings in progress on other instances. The schema now records its version. A cold start does one plain read and runs the DDL (under an advisory lock) only when the schema is actually out of date. `test/migrate.test.ts` covers this.
+
+## Deploy
+
+Hosted on Netlify (functions + the static page), with Postgres on [Neon](https://neon.tech).
+
+```bash
+npx netlify-cli env:set DATABASE_URL "<Neon pooled connection string>"
+npx netlify-cli env:set API_KEY "<a long random key>"
+npx netlify-cli deploy --prod
+BASE_URL=https://<site>.netlify.app API_KEY=<key> node scripts/smoke.mjs   # checks every level live (resets data)
+BASE_URL=https://<site>.netlify.app API_KEY=<key> node scripts/seed.mjs    # two weeks of upcoming slots
+```
+
 ## Run the tests
 
 Needs a local Postgres. Tests run against a real database rather than mocks.
