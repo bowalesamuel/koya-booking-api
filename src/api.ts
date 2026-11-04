@@ -59,8 +59,10 @@ export async function handle(req: Request, ctx: Context): Promise<Response> {
     }
     const match = path.match(/^\/bookings\/([^/]+)$/);
     if (match) {
-      if (method !== "GET") throw new HttpError(405, "method not allowed");
-      return await getBooking(ctx.db, decodeURIComponent(match[1]));
+      const id = decodeURIComponent(match[1]);
+      if (method === "GET") return await getBooking(ctx.db, id);
+      if (method === "DELETE") return await cancelBooking(ctx.db, id);
+      throw new HttpError(405, "method not allowed");
     }
     throw new HttpError(404, "not found");
   } catch (err) {
@@ -169,13 +171,32 @@ async function createBooking(db: Db, body: unknown, now: Date): Promise<Response
   if (!slot.rows[0]) throw new HttpError(404, "slot not found");
   if (new Date(slot.rows[0].start_at) <= now) throw new HttpError(400, "slot has already started");
 
+  // Level 3: the partial unique index decides, not a "check then insert" in
+  // code (which two simultaneous requests could both pass). Exactly one insert
+  // wins; the others hit the conflict and get no row back.
   const { rows } = await db.query<BookingRow>(
     `insert into bookings (id, slot_id, name, email, status, created_at)
      values ($1, $2, $3, $4, 'confirmed', $5)
+     on conflict (slot_id) where status = 'confirmed' do nothing
      returning ${BOOKING_COLUMNS}`,
     [randomUUID(), slotId, name, email, now],
   );
+  if (!rows[0]) throw new HttpError(409, "slot is already booked");
   return json(201, present(rows[0]));
+}
+
+async function cancelBooking(db: Db, id: string): Promise<Response> {
+  // Conditional update: of two cancels racing, only one can flip the status.
+  const { rows } = await db.query<BookingRow>(
+    `update bookings set status = 'cancelled'
+     where id = $1 and status = 'confirmed'
+     returning ${BOOKING_COLUMNS}`,
+    [id],
+  );
+  if (rows[0]) return json(200, present(rows[0]));
+  const exists = await db.query("select 1 from bookings where id = $1", [id]);
+  if (!exists.rows[0]) throw new HttpError(404, "booking not found");
+  throw new HttpError(409, "booking is already cancelled");
 }
 
 async function getBooking(db: Db, id: string): Promise<Response> {

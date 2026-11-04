@@ -24,6 +24,11 @@ create table if not exists bookings (
   status     text not null check (status in ('confirmed', 'cancelled')),
   created_at timestamptz not null default now()
 );
+
+-- Level 3: the database itself refuses a second confirmed booking for a slot,
+-- however many requests arrive at once. Cancelled bookings don't count.
+create unique index if not exists bookings_one_confirmed_per_slot
+  on bookings (slot_id) where status = 'confirmed';
 `;
 
 let pool: Db | undefined;

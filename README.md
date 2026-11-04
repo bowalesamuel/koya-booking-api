@@ -9,7 +9,7 @@ Built to the spec at [koyaacademy.com/assessment-api](https://koyaacademy.com/as
 
 - [x] **Level 1:** list slots, book one, look up a booking
 - [x] **Level 2:** API key, validation
-- [ ] Level 3: no double booking, cancellation
+- [x] **Level 3:** no double booking, cancellation
 - [ ] Level 4: idempotent retries, pagination
 - [ ] Level 5: rate limiting
 
@@ -21,6 +21,7 @@ Built to the spec at [koyaacademy.com/assessment-api](https://koyaacademy.com/as
 | `GET` | `/slots?provider=` | Every slot, earliest first, with `available` |
 | `POST` | `/bookings` | Book a slot: `{ slot_id, name, email }` → `201` |
 | `GET` | `/bookings/{id}` | Look up a booking |
+| `DELETE` | `/bookings/{id}` | Cancel a booking and free the slot |
 
 Errors are always `{ "error": "<message>" }`.
 
@@ -35,6 +36,15 @@ Every request needs an `X-API-Key` header matching the server's `API_KEY` enviro
 | `201` | Booked. `name` and `email` are trimmed, and `email` is stored in lower case |
 | `400` | `slot_id`, `name` or `email` missing or empty, `email` not valid, invalid JSON, or the slot has already started |
 | `404` | The slot doesn't exist |
+| `409` | The slot already has a confirmed booking |
+
+### No double booking, even at the same moment
+
+Checking "is this slot free?" in code and then inserting has a gap: two requests can both see the slot as free, and both insert. So the database enforces the rule instead. There's a partial unique index on `bookings(slot_id) WHERE status = 'confirmed'`, and the insert uses `ON CONFLICT DO NOTHING`. However many requests arrive at once, Postgres lets exactly one insert succeed; the rest get no row back and return `409`. A cancelled booking falls outside the index, so cancelling frees the slot.
+
+Cancelling is a single conditional update (`... WHERE status = 'confirmed'`), so two simultaneous cancels can't both succeed: one gets `200` and the other `409`.
+
+The tests fire 20 simultaneous bookings at one slot over 20 real database connections, and check that exactly one wins.
 
 ## Run the tests
 
