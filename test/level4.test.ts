@@ -119,7 +119,13 @@ describe("Level 4: paging through a person's bookings", () => {
       id: `m${i}`, provider: "Dr Ade", start: `2099-02-${String(i + 1).padStart(2, "0")}T09:00:00Z`, end: `2099-02-${String(i + 1).padStart(2, "0")}T09:30:00Z`,
     }));
     await send("POST", "/reset", { slots: many });
-    for (const s of many) await send("POST", "/bookings", book(s.id));
+    // Space the bookings out so the level 5 rate limit (5 a minute) doesn't kick in.
+    const start = Date.parse("2030-01-01T00:00:00Z");
+    for (const [i, s] of many.entries()) {
+      t.clock = new Date(start + i * 15_000);
+      expect((await send("POST", "/bookings", book(s.id))).status).toBe(201);
+    }
+    t.clock = undefined;
     const first = (await send("GET", "/bookings?email=ada@example.com")).body;
     expect(first.bookings).toHaveLength(10);
     const rest = (await send("GET", `/bookings?email=ada@example.com&cursor=${first.next_cursor}`)).body;

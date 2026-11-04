@@ -43,6 +43,14 @@ create table if not exists idempotency_keys (
   response     jsonb not null,
   created_at   timestamptz not null default now()
 );
+
+-- Level 5: one row per booking attempt, counted over a sliding minute.
+create table if not exists booking_attempts (
+  id    bigserial primary key,
+  email text not null,
+  at    timestamptz not null
+);
+create index if not exists booking_attempts_email_at on booking_attempts (email, at);
 `;
 
 let pool: Db | undefined;

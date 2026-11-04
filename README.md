@@ -11,7 +11,7 @@ Built to the spec at [koyaacademy.com/assessment-api](https://koyaacademy.com/as
 - [x] **Level 2:** API key, validation
 - [x] **Level 3:** no double booking, cancellation
 - [x] **Level 4:** idempotent retries, pagination
-- [ ] Level 5: rate limiting
+- [x] **Level 5:** rate limiting
 
 ## Endpoints
 
@@ -39,6 +39,7 @@ Every request needs an `X-API-Key` header matching the server's `API_KEY` enviro
 | `404` | The slot doesn't exist |
 | `409` | The slot already has a confirmed booking |
 | `422` | The `Idempotency-Key` was already used with a different body |
+| `429` | More than 5 attempts for this email in the last minute. `Retry-After` says how many seconds to wait |
 
 ### No double booking, even at the same moment
 
@@ -61,6 +62,18 @@ The body is compared by a hash of its canonical JSON, so key order and whitespac
 ### Paging through a person's bookings
 
 `GET /bookings?email=…` returns that person's bookings oldest first (email matching ignores case), 10 per page by default and up to 50. Each booking gets an increasing sequence number when it's created. `next_cursor` is an opaque encoding of the last one on the page, and the next page starts after it. Unlike page numbers, this can't skip or repeat bookings if new ones are made between pages. The last page has `next_cursor: null`.
+
+### Stopping spam (rate limiting)
+
+Each email gets at most 5 booking attempts in any 60 seconds. Failed attempts count too, so someone can't hammer the API with bad requests. The 6th attempt gets `429` with a `Retry-After` header: the whole seconds until the oldest attempt leaves the window.
+
+- **A sliding window, not a fixed one.** With a fixed window (a counter that resets every minute), someone could make 5 attempts at 0:59 and 5 more at 1:00. Here each attempt is a timestamped row, and only rows from the last 60 seconds count.
+- **Exact under bursts.** The check and the insert run in the same transaction, which holds an advisory lock on the email. When 12 requests for one email arrive at once, exactly 5 get through.
+- **Fair.** The email is trimmed and lower-cased before counting, so `Ada@Example.com` and `ada@example.com` share one limit. Rejected (`429`) attempts aren't recorded, so the wait doesn't keep growing. Other emails aren't affected.
+- **Works with retries.** Replaying a stored `Idempotency-Key` response doesn't count as an attempt, and a `429` is never stored against a key, so the same retry works once the wait is over.
+- `/reset` clears the counters.
+
+Because it's stored in Postgres rather than in memory, the limit holds across every serverless instance.
 
 ## Run the tests
 

@@ -11,6 +11,8 @@ export interface Context {
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+export const RATE_LIMIT = 5;
+export const RATE_WINDOW_SECONDS = 60;
 
 class HttpError extends Error {
   constructor(public status: number, message: string) {
@@ -18,10 +20,10 @@ class HttpError extends Error {
   }
 }
 
-function json(status: number, body: unknown): Response {
+function json(status: number, body: unknown, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
 }
 
@@ -106,7 +108,7 @@ async function reset(db: Db, body: unknown): Promise<Response> {
 
   // Deletes every booking and replaces all slots, in one transaction.
   await withTx(db, async (tx) => {
-    await tx.query("truncate bookings, slots, idempotency_keys");
+    await tx.query("truncate bookings, slots, idempotency_keys, booking_attempts");
     if (rows.length) {
       await tx.query(
         `insert into slots (id, provider, start_raw, end_raw, start_at, end_at)
@@ -155,7 +157,7 @@ function present(b: BookingRow) {
 
 const BOOKING_COLUMNS = "id, slot_id, name, email, status, created_at";
 
-type Outcome = { status: number; body: unknown };
+type Outcome = { status: number; body: unknown; headers?: Record<string, string> };
 
 /** Stable hash of the request body, so key order and whitespace don't matter. */
 function hashBody(raw: string): string {
@@ -177,40 +179,45 @@ function hashBody(raw: string): string {
 async function createBooking(db: Db, req: Request, now: Date): Promise<Response> {
   const raw = await req.text();
   const idemKey = req.headers.get("idempotency-key");
-  if (!idemKey) {
-    const { status, body } = await attemptBooking(db, raw, now);
-    return json(status, body);
-  }
+  const requestHash = idemKey ? hashBody(raw) : "";
 
-  // Level 4: the whole attempt runs in one transaction holding a lock on the
-  // key, so a retry that arrives while the first request is still running
-  // waits for it and then replays its stored response instead of booking again.
-  const requestHash = hashBody(raw);
-  const { status, body } = await withTx(db, async (tx): Promise<Outcome> => {
-    await tx.query("select pg_advisory_xact_lock(hashtext($1))", [idemKey]);
-    const { rows } = await tx.query(
-      "select request_hash, status_code, response from idempotency_keys where key = $1",
-      [idemKey],
-    );
-    if (rows[0]) {
-      if (rows[0].request_hash !== requestHash) {
-        return { status: 422, body: { error: "Idempotency-Key was already used with a different request body" } };
+  // Each attempt runs in one transaction. Advisory locks serialise requests
+  // that share an Idempotency-Key (level 4) or an email (level 5), so retries
+  // and rate limits stay exact even when requests arrive at the same instant
+  // on different function instances.
+  const { status, body, headers } = await withTx(db, async (tx): Promise<Outcome> => {
+    if (idemKey) {
+      // Level 4: a retry that arrives while the first request is still running
+      // waits for it, then replays its stored response instead of booking again.
+      await tx.query("select pg_advisory_xact_lock(1, hashtext($1))", [idemKey]);
+      const { rows } = await tx.query(
+        "select request_hash, status_code, response from idempotency_keys where key = $1",
+        [idemKey],
+      );
+      if (rows[0]) {
+        if (rows[0].request_hash !== requestHash) {
+          return { status: 422, body: { error: "Idempotency-Key was already used with a different request body" } };
+        }
+        return { status: rows[0].status_code, body: rows[0].response };
       }
-      return { status: rows[0].status_code, body: rows[0].response };
     }
 
     const result = await attemptBooking(tx, raw, now);
-    await tx.query(
-      "insert into idempotency_keys (key, request_hash, status_code, response) values ($1, $2, $3, $4)",
-      [idemKey, requestHash, result.status, JSON.stringify(result.body)],
-    );
+
+    // A 429 isn't stored: it's temporary, and a retry after the wait should go through.
+    if (idemKey && result.status !== 429) {
+      await tx.query(
+        "insert into idempotency_keys (key, request_hash, status_code, response) values ($1, $2, $3, $4)",
+        [idemKey, requestHash, result.status, JSON.stringify(result.body)],
+      );
+    }
     return result;
   });
-  return json(status, body);
+  return json(status, body, headers);
 }
 
 /** One booking attempt, as a status and body, so the result can be stored and replayed. */
-async function attemptBooking(q: Db | Tx, raw: string, now: Date): Promise<Outcome> {
+async function attemptBooking(tx: Tx, raw: string, now: Date): Promise<Outcome> {
   try {
     let body: unknown;
     try {
@@ -218,11 +225,46 @@ async function attemptBooking(q: Db | Tx, raw: string, now: Date): Promise<Outco
     } catch {
       throw new HttpError(400, "request body must be valid JSON");
     }
-    return { status: 201, body: await bookSlot(q, body, now) };
+
+    // Level 5: count the attempt before validating, so failed attempts count too.
+    const email = (body as { email?: unknown })?.email;
+    if (typeof email === "string" && email.trim()) {
+      const limited = await checkRateLimit(tx, email.trim().toLowerCase(), now);
+      if (limited) return limited;
+    }
+
+    return { status: 201, body: await bookSlot(tx, body, now) };
   } catch (err) {
     if (err instanceof HttpError) return { status: err.status, body: { error: err.message } };
     throw err;
   }
+}
+
+/**
+ * Level 5: at most RATE_LIMIT attempts per email in any RATE_WINDOW_SECONDS
+ * (a sliding window). Returns a 429 outcome when over the limit, else records
+ * the attempt. Rejected attempts aren't recorded, so Retry-After stays accurate.
+ */
+async function checkRateLimit(tx: Tx, email: string, now: Date): Promise<Outcome | null> {
+  await tx.query("select pg_advisory_xact_lock(2, hashtext($1))", [email]);
+  const windowStart = new Date(now.getTime() - RATE_WINDOW_SECONDS * 1000);
+  await tx.query("delete from booking_attempts where email = $1 and at <= $2", [email, windowStart]);
+  const { rows } = await tx.query(
+    "select count(*)::int as n, min(at) as oldest from booking_attempts where email = $1",
+    [email],
+  );
+  if (rows[0].n >= RATE_LIMIT) {
+    // Wait until the oldest attempt in the window drops out of it.
+    const freesAt = new Date(rows[0].oldest).getTime() + RATE_WINDOW_SECONDS * 1000;
+    const retryAfter = Math.max(1, Math.ceil((freesAt - now.getTime()) / 1000));
+    return {
+      status: 429,
+      body: { error: "too many booking attempts for this email, try again later" },
+      headers: { "Retry-After": String(retryAfter) },
+    };
+  }
+  await tx.query("insert into booking_attempts (email, at) values ($1, $2)", [email, now]);
+  return null;
 }
 
 async function bookSlot(db: Db | Tx, body: unknown, now: Date) {
